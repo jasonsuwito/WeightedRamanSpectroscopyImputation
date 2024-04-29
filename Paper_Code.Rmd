@@ -1,0 +1,217 @@
+---
+title: "Final Imputation Function"
+author: "Jason Samuel Suwito, 19168566"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Load All Data
+library(R.matlab)
+prostate <- readMat("ProstateRSdata_Jason.mat")
+library('imputeLCMD')
+library('missForest')
+```
+
+```{r}
+#Generate Weights using Chebyshev
+generateWeight <- function(matrix, target_row, target_col, layer=0) {
+  numrow <- nrow(matrix)
+  numcol <- ncol(matrix)
+  
+  for (row in 1:numrow) {
+      for (col in 1:numcol) {
+          # Chebyshev distance
+          distance <- max(abs(row - target_row), abs(col - target_col))
+  
+          if (distance > 0) {
+            weight <- 1 / distance
+            
+            #Changing the threshold based on number of layers
+            if (layer==0){ #All layers
+                matrix[row, col] <- weight
+            } else { #Custom layer
+                if (weight < 1/layer){
+                  matrix[row, col] <- 0
+                } else {
+                  matrix[row, col] <- weight
+                }
+            }
+          } else {
+            matrix[row, col] <- 0
+          }
+      }
+  }
+  
+  return(c(t(matrix)))
+}
+
+#Weighted Mean Calculation
+imputeWeightedMeanPerColumn <- function(column, weights){
+  nonNaIdx <- !is.na(column)
+  result <- sum(column[nonNaIdx] * weights[nonNaIdx] / sum(weights[nonNaIdx]))
+  return(result)
+}
+
+#Weighted Impute Function
+RSWeightedImpute <- function(data, rowDim, colDim, targetIndex, numWavelength=814, layer=0){
+  #Convert to 2D matrix index
+  targetrow <- (targetIndex-1) %/% colDim + 1
+  targetcol <- (targetIndex-1) %% colDim + 1
+  
+  #Generate Weight
+  weightPlaceholder <- matrix(0, rowDim, colDim)
+  weightMatrix <- generateWeight(weightPlaceholder, targetrow, targetcol, layer)
+  
+  #Weighted Random Forest
+  library(missRanger)
+  imputed.wrf <- as.matrix(missRanger(as.data.frame(data), case.weights=weightMatrix, maxiter=5, sample.fraction=0.1, num.trees=80, seed=8566, verbose=0))
+  
+  #Weighted Mean:
+  ImputedValues <- numeric(numWavelength)
+  for(i in 1:numWavelength){
+    ImputedValues[i] <- imputeWeightedMeanPerColumn(data[,i],weightMatrix)
+  }
+  imputed.wmean <- data
+  imputed.wmean[targetIndex,] <- ImputedValues
+  
+  result <- list(imputed.wrf, imputed.wmean)
+  return(result)
+}
+
+regularImpute <- function(data){
+  #Non-Spatial Imputation
+  #QRILC
+  obj.QRILC = impute.QRILC(data)
+  imputed.qrilc = as.matrix(obj.QRILC[[1]])
+
+  #KNN
+  obj.KNN = impute.knn(data, k=8, rowmax = 1)
+  imputed.knn = as.matrix(obj.KNN[[1]])
+
+  #RandomForest
+  imputed.rf = as.matrix(missRanger(as.data.frame(data), maxiter=5, sample.fraction=0.1, num.trees=80, seed=8566))
+  
+  result <- list(imputed.qrilc, imputed.knn, imputed.rf)
+  return(result)
+}
+
+#normalized root mean squared error
+nrmse <- function(actual, predicted){
+  sqrt( mean((predicted - actual)^2) / var(actual) ) * 100
+}
+```
+
+```{r}
+#single file
+targetIdx = 30
+name = "Post.102.LeftApex.S1.1"
+file <- prostate[[name]]
+#Convert NaN to NA
+file[is.na(file)] = NA
+#Transpose data so that each row is one spectra
+file.trans = t(file)
+#Original Data
+file.original = file.trans
+#Manually Remove Corner, Center, and Edge
+data = file.trans
+
+data[targetIdx,] = NA
+
+spatial0 <- RSWeightedImpute(data,rowDim=8,colDim=8,targetIndex=targetIdx,numWavelength=814,layer=0)
+spatial1 <- RSWeightedImpute(data,rowDim=8,colDim=8,targetIndex=targetIdx,numWavelength=814,layer=1)
+spatial2 <- RSWeightedImpute(data,rowDim=8,colDim=8,targetIndex=targetIdx,numWavelength=814,layer=2)
+spatial3 <- RSWeightedImpute(data,rowDim=8,colDim=8,targetIndex=targetIdx,numWavelength=814,layer=3)
+
+regular <- regularImpute(data)
+```
+
+```{r}
+png(file=paste("spectra_plot/", name, ".w3.30.png", sep=""), width = 1920, height = 1080, res=200)
+
+plot(file.original[targetIdx,], main = "Spatial Imputation with Weight 3", type = "l", frame = FALSE, col = "red", xlab = "Wave Number", ylab = "Intensity", lwd=2)
+lines(spatial3[[1]][targetIdx,], col = "blue", type = "l", lty = 2, lwd=2)
+lines(spatial3[[2]][targetIdx,], col = "green", type = "l", lty = 3, lwd=2)
+axis(side=1, at=seq(0, 800, by=25))
+
+legend("topleft", legend=c("Original", "Weighted RF", "Weighted Mean"), col=c("red", "blue", "green"), lty = 1:3, cex=0.7)
+```
+
+```{r}
+png(file=paste("spectra_plot/", name, ".regular.30.png", sep=""), width = 1920, height = 1080, res=200)
+
+plot(file.original[targetIdx,], main = "Non-Spatial Imputation", type = "l", frame = FALSE, col = "red", xlab = "Wave Number", ylab = "Intensity", lwd=2)
+lines(regular[[1]][targetIdx,], col = "blue", type = "l", lty = 1, lwd=1)
+lines(regular[[2]][targetIdx,], col = "green", type = "l", lty = 1, lwd=1)
+lines(regular[[3]][targetIdx,], col = "orange", type = "l", lty = 1, lwd=1.5 )
+axis(side=1, at=seq(0, 800, by=25))
+
+legend("topleft", legend=c("Original", "QRILC", "KNN", "Random Forest"), col=c("red", "blue", "green", "orange"), lty = 1, cex=0.7)
+```
+
+```{r}
+targetIdx = 23
+
+datadim <- nineBySix
+nrmse.wrf0 <- numeric(length(datadim))
+nrmse.wmean0 <- numeric(length(datadim))
+nrmse.wrf1 <- numeric(length(datadim))
+nrmse.wmean1 <- numeric(length(datadim))
+nrmse.wrf2 <- numeric(length(datadim))
+nrmse.wmean2 <- numeric(length(datadim))
+nrmse.wrf3 <- numeric(length(datadim))
+nrmse.wmean3 <- numeric(length(datadim))
+
+nrmse.qrilc <- numeric(length(datadim))
+nrmse.knn <- numeric(length(datadim))
+nrmse.rf <- numeric(length(datadim))
+
+count = 1
+for(i in datadim){
+  file <- i
+  #Convert NaN to NA
+  file[is.na(file)] = NA
+  #Transpose data so that each row is one spectra
+  file.trans = t(file)
+  #Original Data
+  file.original = file.trans
+  #Manually Remove Corner, Center, and Edge
+  data = file.trans
+
+  data[targetIdx,] = NA
+  
+  spatial0 <- RSWeightedImpute(data,rowDim=6,colDim=9,targetIndex=targetIdx,numWavelength=814,layer=0)
+  spatial1 <- RSWeightedImpute(data,rowDim=6,colDim=9,targetIndex=targetIdx,numWavelength=814,layer=1)
+  spatial2 <- RSWeightedImpute(data,rowDim=6,colDim=9,targetIndex=targetIdx,numWavelength=814,layer=2)
+  spatial3 <- RSWeightedImpute(data,rowDim=6,colDim=9,targetIndex=targetIdx,numWavelength=814,layer=3)
+  
+  regular <- regularImpute(data)
+  
+  nrmse.wrf0[count] <- nrmse(file.original[targetIdx,],spatial0[[1]][targetIdx,])
+  nrmse.wmean0[count] <- nrmse(file.original[targetIdx,],spatial0[[2]][targetIdx,])
+  nrmse.wrf1[count] <- nrmse(file.original[targetIdx,],spatial1[[1]][targetIdx,])
+  nrmse.wmean1[count] <- nrmse(file.original[targetIdx,],spatial1[[2]][targetIdx,])
+  nrmse.wrf2[count] <- nrmse(file.original[targetIdx,],spatial2[[1]][targetIdx,])
+  nrmse.wmean2[count] <- nrmse(file.original[targetIdx,],spatial2[[2]][targetIdx,])
+  nrmse.wrf3[count] <- nrmse(file.original[targetIdx,],spatial3[[1]][targetIdx,])
+  nrmse.wmean3[count] <- nrmse(file.original[targetIdx,],spatial3[[2]][targetIdx,])
+  
+  nrmse.qrilc[count] <- nrmse(file.original[targetIdx,],regular[[1]][targetIdx,])
+  nrmse.knn[count] <- nrmse(file.original[targetIdx,],regular[[2]][targetIdx,])
+  nrmse.rf[count] <- nrmse(file.original[targetIdx,],regular[[3]][targetIdx,])
+  
+  print(count)
+  count = count+1
+}
+
+nrmse.df <- data.frame(nrmse.wrf0, nrmse.wmean0, nrmse.wrf1, nrmse.wmean1, nrmse.wrf2, nrmse.wmean2, nrmse.wrf3, nrmse.wmean3, nrmse.qrilc, nrmse.knn, nrmse.rf)
+write.csv(nrmse.df, "9x6_23.csv")
+```
+
+```{r}
+test <- t(prostate[["Pre.116.RightPosterior.S3.3"]])
+```
